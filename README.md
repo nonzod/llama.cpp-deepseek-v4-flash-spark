@@ -1,11 +1,12 @@
 # DeepSeek v4 Flash experimental support
 
-This is a fork of llama.cpp that implements DSv4 support, with generated GGUF that aims to target MacBooks with just 128GB of RAM using 2bit quantization of routed experts.
+Original project: https://github.com/antirez/llama.cpp-deepseek-v4-flash
 
-Disclaimer:
-* This code was written with heavy help from GPT 5.5 and the official DeepSeek v4 Flash as reference.
-* The model quantized in this way behaves very very well in the chat, frontier-model vibes, but it was not extensively tested.
-* The code runs both with CPU and Metal backends. With Metal is faster.
+This fork adds experimental DeepSeek v4 Flash support to llama.cpp and provides a GGUF path designed for local inference on high-memory machines, especially 128 GB MacBooks, using 2-bit quantization for routed experts while keeping selected tensors at higher precision where needed.
+
+The fork is intended for experimentation, not as a stable upstream replacement. CPU and Metal are the primary tested backends, with Metal providing the best practical path on Apple Silicon. CUDA support is partial: this tree includes a local CUDA concat fix for F32, F16 and BF16 tensors, but DeepSeek v4 Flash inference may still expose backend gaps in matmul, MoE routing or quantized paths depending on the model variant and runtime settings.
+
+The code and model conversion work were developed with heavy AI assistance using the official DeepSeek v4 Flash release as reference. The resulting quantized model works well in chat-style use, but it has not been extensively validated across hardware, prompts or long-context workloads.
 
 Download the GGUF from: https://huggingface.co/antirez/deepseek-v4-gguf
 
