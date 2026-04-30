@@ -14,6 +14,7 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -825,12 +826,201 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    bool dsv4_decode_diag;
+    bool dsv4_decode_fail_on_cpu;
+    int dsv4_decode_diag_graph_count;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static bool ggml_backend_sched_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != NULL && strcmp(value, "0") != 0;
+}
+
+static bool ggml_backend_sched_is_cpu_backend(ggml_backend_sched_t sched, int backend_id) {
+    return ggml_backend_dev_type(ggml_backend_get_device(sched->backends[backend_id])) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+static bool ggml_backend_sched_has_gpu_backend(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_backends; i++) {
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[i]));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_backend_sched_dsv4_nontrivial_cpu_op(const struct ggml_tensor * node) {
+    return node->op != GGML_OP_NONE && !ggml_is_view_op(node->op) && !ggml_is_empty(node);
+}
+
+static void ggml_backend_sched_format_shape(const struct ggml_tensor * tensor, char * buf, size_t buf_size) {
+    snprintf(buf, buf_size, "[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]",
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+}
+
+static const char * ggml_backend_sched_tensor_buffer_name(const struct ggml_tensor * tensor) {
+    const struct ggml_tensor * buf_tensor = tensor->view_src != NULL ? tensor->view_src : tensor;
+    return buf_tensor->buffer != NULL ? ggml_backend_buffer_name(buf_tensor->buffer) : "none";
+}
+
+static void ggml_backend_sched_dsv4_log(const char * fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fflush(stderr);
+}
+
+static void ggml_backend_sched_dsv4_print_tensor_sources(const struct ggml_tensor * node) {
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const struct ggml_tensor * src = node->src[j];
+        if (src == NULL) {
+            continue;
+        }
+
+        char shape[96];
+        ggml_backend_sched_format_shape(src, shape, sizeof(shape));
+        ggml_backend_sched_dsv4_log("  src[%d]: name=%s op=%s type=%s shape=%s buffer=%s\n",
+                j, src->name, ggml_op_name(src->op), ggml_type_name(src->type), shape,
+                ggml_backend_sched_tensor_buffer_name(src));
+    }
+}
+
+static void ggml_backend_sched_dsv4_decode_diag(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool fail_on_cpu) {
+    int backend_counts[GGML_SCHED_MAX_BACKENDS] = {};
+    int op_backend_counts[GGML_OP_COUNT][GGML_SCHED_MAX_BACKENDS] = {};
+    int copy_counts[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_BACKENDS] = {};
+    int n_copy_inputs = 0;
+    int n_cpu_nodes = 0;
+    int first_cpu_node = -1;
+    const bool has_gpu_backend = ggml_backend_sched_has_gpu_backend(sched);
+
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        const int backend_id = tensor_backend_id(node);
+        if (backend_id < 0 || backend_id >= sched->n_backends) {
+            continue;
+        }
+
+        backend_counts[backend_id]++;
+        if (node->op >= 0 && node->op < GGML_OP_COUNT) {
+            op_backend_counts[node->op][backend_id]++;
+        }
+
+        if (ggml_backend_sched_is_cpu_backend(sched, backend_id) &&
+                ggml_backend_sched_dsv4_nontrivial_cpu_op(node)) {
+            n_cpu_nodes++;
+            if (first_cpu_node < 0) {
+                first_cpu_node = i;
+            }
+        }
+    }
+
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; j++) {
+            const struct ggml_tensor * input = split->inputs[j];
+            const size_t input_hash = ggml_hash_find(&sched->hash_set, input);
+            if (input_hash == GGML_HASHSET_FULL) {
+                continue;
+            }
+            const int src_backend_id = sched->hv_tensor_backend_ids[input_hash];
+            if (src_backend_id >= 0 && src_backend_id < sched->n_backends &&
+                    split->backend_id >= 0 && split->backend_id < sched->n_backends) {
+                copy_counts[src_backend_id][split->backend_id]++;
+                n_copy_inputs++;
+            }
+        }
+    }
+
+    sched->dsv4_decode_diag_graph_count++;
+    ggml_backend_sched_dsv4_log("llama_dsv4_decode_diag: graph #%d: nodes=%d leafs=%d splits=%d split_inputs=%d copies=%d\n",
+            sched->dsv4_decode_diag_graph_count, graph->n_nodes, graph->n_leafs, sched->n_splits, n_copy_inputs, n_copy_inputs);
+
+    ggml_backend_sched_dsv4_log("llama_dsv4_decode_diag: nodes by backend:");
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_sched_dsv4_log(" %s=%d", ggml_backend_name(sched->backends[b]), backend_counts[b]);
+    }
+    ggml_backend_sched_dsv4_log("\n");
+
+    ggml_backend_sched_dsv4_log("llama_dsv4_decode_diag: op/backend counts:\n");
+    for (int op = 0; op < GGML_OP_COUNT; op++) {
+        bool any = false;
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (op_backend_counts[op][b] > 0) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            continue;
+        }
+
+        ggml_backend_sched_dsv4_log("  %-16s", ggml_op_name((enum ggml_op) op));
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (op_backend_counts[op][b] > 0) {
+                ggml_backend_sched_dsv4_log(" %s=%d", ggml_backend_name(sched->backends[b]), op_backend_counts[op][b]);
+            }
+        }
+        ggml_backend_sched_dsv4_log("\n");
+    }
+
+    if (n_copy_inputs > 0) {
+        ggml_backend_sched_dsv4_log("llama_dsv4_decode_diag: split input copies:\n");
+        for (int src = 0; src < sched->n_backends; src++) {
+            for (int dst = 0; dst < sched->n_backends; dst++) {
+                if (copy_counts[src][dst] > 0) {
+                    ggml_backend_sched_dsv4_log("  %s -> %s: %d\n",
+                            ggml_backend_name(sched->backends[src]), ggml_backend_name(sched->backends[dst]), copy_counts[src][dst]);
+                }
+            }
+        }
+    }
+
+    if (n_cpu_nodes > 0) {
+        int printed = 0;
+        ggml_backend_sched_dsv4_log("llama_dsv4_decode_diag: CPU compute nodes=%d%s\n",
+                n_cpu_nodes, has_gpu_backend ? " while GPU backend is available" : "");
+        for (int i = 0; i < graph->n_nodes && printed < 32; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            const int backend_id = tensor_backend_id(node);
+            if (backend_id < 0 || backend_id >= sched->n_backends ||
+                    !ggml_backend_sched_is_cpu_backend(sched, backend_id) ||
+                    !ggml_backend_sched_dsv4_nontrivial_cpu_op(node)) {
+                continue;
+            }
+
+            char shape[96];
+            ggml_backend_sched_format_shape(node, shape, sizeof(shape));
+            ggml_backend_sched_dsv4_log("  node #%d: name=%s op=%s type=%s shape=%s buffer=%s\n",
+                    i, node->name, ggml_op_name(node->op), ggml_type_name(node->type), shape,
+                    ggml_backend_sched_tensor_buffer_name(node));
+            ggml_backend_sched_dsv4_print_tensor_sources(node);
+            printed++;
+        }
+        if (printed < n_cpu_nodes) {
+            ggml_backend_sched_dsv4_log("  ... %d more CPU compute nodes omitted\n", n_cpu_nodes - printed);
+        }
+    }
+
+    if (fail_on_cpu && has_gpu_backend && first_cpu_node >= 0) {
+        struct ggml_tensor * node = graph->nodes[first_cpu_node];
+        char shape[96];
+        ggml_backend_sched_format_shape(node, shape, sizeof(shape));
+        ggml_backend_sched_dsv4_log("llama_dsv4_decode_diag: aborting because graph node #%d is assigned to CPU with GPU available: name=%s op=%s type=%s shape=%s buffer=%s\n",
+                first_cpu_node, node->name, ggml_op_name(node->op), ggml_type_name(node->type), shape,
+                ggml_backend_sched_tensor_buffer_name(node));
+        ggml_backend_sched_dsv4_print_tensor_sources(node);
+        GGML_ABORT("LLAMA_DSV4_DECODE_FAIL_ON_CPU=1: CPU compute fallback detected");
+    }
+}
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -1765,6 +1955,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
+    sched->dsv4_decode_diag = ggml_backend_sched_env_enabled("LLAMA_DSV4_DECODE_DIAG");
+    sched->dsv4_decode_fail_on_cpu = ggml_backend_sched_env_enabled("LLAMA_DSV4_DECODE_FAIL_ON_CPU");
+    sched->dsv4_decode_diag_graph_count = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
@@ -1841,6 +2034,10 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    if (sched->dsv4_decode_diag) {
+        ggml_backend_sched_dsv4_decode_diag(sched, measure_graph, false);
+    }
+
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
 }
 
@@ -1851,6 +2048,10 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+
+    if (sched->dsv4_decode_diag) {
+        ggml_backend_sched_dsv4_decode_diag(sched, measure_graph, false);
+    }
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
@@ -1870,6 +2071,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
     ggml_backend_sched_split_graph(sched, graph);
+
+    if (sched->dsv4_decode_diag || sched->dsv4_decode_fail_on_cpu) {
+        ggml_backend_sched_dsv4_decode_diag(sched, graph, sched->dsv4_decode_fail_on_cpu);
+    }
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;

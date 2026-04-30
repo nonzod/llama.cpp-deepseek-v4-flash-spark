@@ -20,6 +20,21 @@
 
 // dedup helpers
 
+static bool llama_graph_non_cpu_backend_supports_op(ggml_backend_sched_t sched, ggml_backend_t backend_cpu, const ggml_tensor * op) {
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n_backends; ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (backend == backend_cpu) {
+            continue;
+        }
+        if (ggml_backend_supports_op(backend, op)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -2017,30 +2032,39 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
     ggml_tensor * cur;
+    ggml_tensor * cur_fattn = nullptr;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
+        ggml_tensor * k_fattn = k;
+        ggml_tensor * v_fattn = v;
+
         if (v_trans) {
-            v = ggml_transpose(ctx0, v);
+            v_fattn = ggml_transpose(ctx0, v_fattn);
         }
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
-        if (k->type == GGML_TYPE_F32) {
-            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        if (k_fattn->type == GGML_TYPE_F32) {
+            k_fattn = ggml_cast(ctx0, k_fattn, GGML_TYPE_F16);
         }
 
-        if (v->type == GGML_TYPE_F32) {
-            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        if (v_fattn->type == GGML_TYPE_F32) {
+            v_fattn = ggml_cast(ctx0, v_fattn, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+        cur_fattn = ggml_flash_attn_ext(ctx0, q, k_fattn, v_fattn, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
+        cb(cur_fattn, LLAMA_TENSOR_NAME_FATTN, il);
 
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        ggml_flash_attn_ext_add_sinks(cur_fattn, sinks);
+        ggml_flash_attn_ext_set_prec (cur_fattn, GGML_PREC_F32);
+        use_flash_attn = llama_graph_non_cpu_backend_supports_op(sched, backend_cpu, cur_fattn);
+    }
+
+    if (use_flash_attn) {
+        cur = cur_fattn;
 
         if (v_mla) {
 #if 0
