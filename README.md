@@ -10,12 +10,38 @@ The code and model conversion work were developed with heavy AI assistance using
 
 Download the GGUF from: https://huggingface.co/antirez/deepseek-v4-gguf
 
+Build this fork with CUDA enabled:
+
+```sh
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
 Then to test it run with (but for production you may want to tune context, disable thinking for faster replies and so forth):
 
-```
-llama-cli \
-    -m DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat.gguf \
+```sh
+./build/bin/llama-cli \
+    -m /path/to/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
+    -ngl 999 \
+    -c 4096 \
+    -b 512 \
+    -ub 128 \
+    --flash-attn on \
+    --fit off \
     -cnv
+```
+
+For a quick CUDA throughput check:
+
+```sh
+./build/bin/llama-bench \
+    -m /path/to/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
+    -ngl 999 \
+    -fa 1 \
+    -p 16 \
+    -n 16 \
+    -b 128 \
+    -ub 32
 ```
 
 # llama.cpp
